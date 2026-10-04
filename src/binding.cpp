@@ -2,6 +2,8 @@
 #include "limiter.hpp"
 
 bool	g_initialized = false;
+int32_t	g_max_tokens = 10;
+uint64_t	g_refill_ms = 1000;
 
 Napi::Value	InitSharedMemory(const Napi::CallbackInfo& info)
 {
@@ -32,6 +34,9 @@ Napi::Value	InitSharedMemory(const Napi::CallbackInfo& info)
 		return env.Null();
 	}
 
+	g_max_tokens = max_tokens;
+	g_refill_ms = refill_ms;
+
 	LimiterConfig lconfig;
 	lconfig.max_tokens = max_tokens;
 	lconfig.refill_ms = refill_ms;
@@ -57,7 +62,7 @@ Napi::Boolean	ConsumeTokenFast(const Napi::CallbackInfo& info)
 		return Napi::Boolean::New(env, false);
 
 	ip = info[0].As<Napi::String>().Utf8Value();
-	return Napi::Boolean::New(env, consume_token(ip.c_str(), max_tokens, refill_ms));
+	return Napi::Boolean::New(env, consume_token(ip.c_str(), g_max_tokens, g_refill_ms));
 }
 
 Napi::Value	Cleanup(const Napi::CallbackInfo& info)

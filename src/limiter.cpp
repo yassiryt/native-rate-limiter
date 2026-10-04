@@ -8,8 +8,9 @@
 #include <algorithm>
 #include <random>
 
-static Bucket*	table = nullptr;
-static uint64_t	g_hash_seed = 0;
+static Bucket*		table = nullptr;
+ControlBlock*		ctrl = nullptr;
+static uint64_t		g_hash_seed = 0;
 
 uint64_t	secure_hash(const char* str)
 {
@@ -42,14 +43,15 @@ bool	init_limiter(int32_t max_tokens, uint64_t refill_ms, const char** err_msg)
 		return false;
 	}
 
-	if (ftruncate(shm_fd, TABLE_SIZE * sizeof(Bucket)) < 0)
+	size_t total_size = TABLE_SIZE * sizeof(Bucket) + sizeof(ControlBlock);
+	if (ftruncate(shm_fd, total_size) < 0)
 	{
 		*err_msg = "ftruncate failed";
 		close(shm_fd);
 		return false;
 	}
 
-	table = (Bucket*)mmap(nullptr, TABLE_SIZE * sizeof(Bucket), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	table = (Bucket*)mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 	close(shm_fd);
 
 	if (table == MAP_FAILED)
@@ -57,6 +59,8 @@ bool	init_limiter(int32_t max_tokens, uint64_t refill_ms, const char** err_msg)
 		*err_msg = "mmap failed";
 		return false;
 	}
+
+	ctrl = (ControlBlock*)((char*)table + TABLE_SIZE * sizeof(Bucket));
 
 	i = 0;
 	while (i < TABLE_SIZE)
@@ -67,7 +71,16 @@ bool	init_limiter(int32_t max_tokens, uint64_t refill_ms, const char** err_msg)
 		i++;
 	}
 
-	init_lru_links();
+	ctrl->lru_lock.clear(std::memory_order_relaxed);
+	ctrl->lru_head.store(0, std::memory_order_relaxed);
+	ctrl->lru_tail.store(TABLE_SIZE - 1, std::memory_order_relaxed);
+	i = 0;
+	while (i < TABLE_SIZE)
+	{
+		ctrl->lru_next[i].store(i + 1, std::memory_order_relaxed);
+		i++;
+	}
+	ctrl->lru_next[TABLE_SIZE - 1].store(SIZE_MAX, std::memory_order_relaxed);
 
 	return true;
 }
@@ -146,7 +159,10 @@ bool	consume_token(const char* ip_str, int32_t max_tokens, uint64_t refill_ms)
 	while (toks > 0)
 	{
 		if (b->toks.compare_exchange_weak(toks, toks - 1, std::memory_order_acq_rel))
+		{
+			move_lru_to_tail(idx);
 			return true;
+		}
 	}
 
 	return false;
@@ -156,8 +172,9 @@ void	cleanup_limiter()
 {
 	if (table && table != MAP_FAILED)
 	{
-		munmap(table, TABLE_SIZE * sizeof(Bucket));
+		munmap(table, TABLE_SIZE * sizeof(Bucket) + sizeof(ControlBlock));
 		table = nullptr;
+		ctrl = nullptr;
 	}
 	shm_unlink("/node_rate_limiter_shm");
 }
