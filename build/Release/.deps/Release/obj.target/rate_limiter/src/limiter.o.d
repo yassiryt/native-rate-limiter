@@ -1,6 +1,0 @@
-cmd_Release/obj.target/rate_limiter/src/limiter.o := c++ -o Release/obj.target/rate_limiter/src/limiter.o ../src/limiter.cpp '-DNODE_GYP_MODULE_NAME=rate_limiter' '-DUSING_UV_SHARED=1' '-DUSING_V8_SHARED=1' '-DV8_DEPRECATION_WARNINGS=1' '-D_GLIBCXX_USE_CXX11_ABI=1' '-D_FILE_OFFSET_BITS=64' '-D_DARWIN_USE_64_BIT_INODE=1' '-D_LARGEFILE_SOURCE' '-DNAPI_DISABLE_CPP_EXCEPTIONS' '-DBUILDING_NODE_EXTENSION' -I/Users/user/Library/Caches/node-gyp/24.10.0/include/node -I/Users/user/Library/Caches/node-gyp/24.10.0/src -I/Users/user/Library/Caches/node-gyp/24.10.0/deps/openssl/config -I/Users/user/Library/Caches/node-gyp/24.10.0/deps/openssl/openssl/include -I/Users/user/Library/Caches/node-gyp/24.10.0/deps/uv/include -I/Users/user/Library/Caches/node-gyp/24.10.0/deps/zlib -I/Users/user/Library/Caches/node-gyp/24.10.0/deps/v8/include -I/Users/user/Desktop/MyProjects/Personal/native-rate-limiter/node_modules/node-addon-api  -O3 -gdwarf-2 -fno-strict-aliasing -mmacosx-version-min=13.5 -arch x86_64 -Wall -Wendif-labels -W -Wno-unused-parameter -std=gnu++20 -stdlib=libc++ -fno-rtti -fno-exceptions -MMD -MF ./Release/.deps/Release/obj.target/rate_limiter/src/limiter.o.d.raw   -c
-Release/obj.target/rate_limiter/src/limiter.o: ../src/limiter.cpp \
-  ../src/limiter.hpp ../src/lru.cpp
-../src/limiter.cpp:
-../src/limiter.hpp:
-../src/lru.cpp:
