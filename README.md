@@ -1,6 +1,6 @@
 # Native C++ Rate Limiter for Node.js
 
-A fast rate limiter that runs in shared memory. No GC pauses. Works across PM2 workers.
+A fast rate limiter using shared memory and token buckets. Runs in a single process with workers sharing memory on the same machine.
 
 ## Install
 
@@ -25,27 +25,78 @@ app.use((req, res, next) => {
 });
 ```
 
+## Architecture
+
+        Node.js / Express
+              │
+              ▼
+        Node-API binding
+              │
+              ▼
+        C++ Rate Limiter
+              │
+        ┌─────┴─────┐
+        ▼           ▼
+        Shared       Atomic
+        Memory       Operations
+        │
+        ▼
+        Hash Table → LRU
+
+- **Shared memory** (`/node_rate_limiter_shm`) — used by multiple worker processes on one machine. Each process has its own V8 heap; only the SHM region is shared.
+- **Token bucket** — tokens refill every `windowMs` milliseconds at rate configured by `maxTokens`.
+- **LRU eviction** — uses a spinlock to safely evict old entries when the table is full. Not lock-free.
+- **Fixed table** — 65,536 buckets, FNV-1a hash with per-run random seed.
+
 ## How It Works
 
-- **Shared memory** (`/node_rate_limiter_shm`) — survives process restarts, shared across workers
-- **Lock-free** — CAS atomic operations, no mutexes
-- **Fixed table** — 65,536 buckets, 64-byte aligned to avoid false sharing
-- **FNV-1a hash** — random seed per run prevents collision attacks
-- **Token bucket** — tokens refill every `windowMs` milliseconds
-- **LRU Eviction** - Uses a hardware spinlock to safely delete old IPs when the table is full.
+1. **Hash** — FNV-1a hash of the IP string produces a 64-bit value
+2. **Bucket lookup** — `ip_hash % 65536` selects the bucket index
+3. **CAS atomic operations** — `compare_exchange_strong` handles concurrent insert/refresh without mutexes (for the hash table). LRU uses a spinlock.
+4. **Token refill** — if `(now - last_ts) > windowMs`, tokens are restored up to `max_tokens`
+5. **LRU eviction** — when the table is full, oldest entries are evicted using a hardware spinlock to safely remove from the linked list
+6. **Per-IP isolation** — each unique IP gets its own bucket; different IPs do not interfere
+
+## Configuration
+
+| Option      |     Description                  |Default|
+|-------------|----------------------------------|-------|
+| `maxTokens` | Max tokens per IP window         | `10`  |
+| `windowMs`  | Refill interval in ms            | `1000`|
+| `policy`    | Eviction policy: `LRU` or `FIFO` | `LRU` |
+
+
+
+## Build
+
+```bash
+npm install
+npx node-gyp configure build
+```
+
+## Test
+
+```bash
+npm test
+```
+
+## Benchmark
+
+Run the included benchmark:
+
+```bash
+node benchmark/simple.js
+```
+
+Output: requests/second for the configured workload.
 
 ## Limitations (by design)
 
-- Single machine only (no Redis, no cluster sync)
-- Fixed window (burst at window boundaries)
-- No persistence across reboots
+- Single machine only — no Redis, no cluster sync
+- Fixed window — burst possible at window boundaries
+- No persistence across reboots (shared memory is lost if all processes exit)
 - One config for all IPs
-
-## Production Tips
-
-- Call `cleanup()` in `process.on('exit')` and `process.on('SIGTERM')`
-- Monitor `/dev/shm/node_rate_limiter_shm` size (about 4 MB)
-- Run with `--max-old-space-size` lower since this bypasses V8 heap
+- LRU uses a spinlock — not lock-free
 
 ## License
 

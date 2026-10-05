@@ -119,7 +119,10 @@ bool	consume_token(const char* ip_str, int32_t max_tokens, uint64_t refill_ms)
 		{
 			expected = 0;
 			if (b->ip_hash.compare_exchange_strong(expected, ip_h, std::memory_order_acq_rel))
+			{
+				move_lru_to_tail(idx);
 				break;
+			}
 			continue;
 		}
 
@@ -133,6 +136,7 @@ bool	consume_token(const char* ip_str, int32_t max_tokens, uint64_t refill_ms)
 			{
 				b->toks.store(max_tokens, std::memory_order_release);
 				b->ts.store(now, std::memory_order_release);
+				move_lru_to_tail(idx);
 				break;
 			}
 		}
