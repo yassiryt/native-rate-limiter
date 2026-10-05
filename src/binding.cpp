@@ -12,6 +12,7 @@ Napi::Value	InitSharedMemory(const Napi::CallbackInfo& info)
 	int32_t		max_tokens = 10;
 	uint64_t	refill_ms = 1000;
 	EvictionPolicy policy = EvictionPolicy::LRU;
+	bool		invalid_policy = false;
 	const char*	err_msg = nullptr;
 
 	if (info.Length() > 0 && info[0].IsObject())
@@ -24,14 +25,21 @@ Napi::Value	InitSharedMemory(const Napi::CallbackInfo& info)
 		if (config.Has("policy"))
 		{
 			std::string p = config.Get("policy").As<Napi::String>().Utf8Value();
-			if (p == "FIFO") policy = EvictionPolicy::FIFO;
+			if (p == "FIFO")
+				policy = EvictionPolicy::FIFO;
+			else if (p != "LRU")
+				invalid_policy = true;
 		}
+	}
+	if (invalid_policy || policy != EvictionPolicy::LRU)
+	{
+		Napi::Error::New(env, "FIFO eviction policy is not supported").ThrowAsJavaScriptException();
+		return env.Null();
 	}
 
 	if (g_initialized)
 	{
-		Napi::Error::New(env, "Limiter already initialized").ThrowAsJavaScriptException();
-		return env.Null();
+		return Napi::Boolean::New(env, true);
 	}
 
 	g_max_tokens = max_tokens;
@@ -48,7 +56,6 @@ Napi::Value	InitSharedMemory(const Napi::CallbackInfo& info)
 		return env.Null();
 	}
 
-	lru_init();
 	g_initialized = true;
 	return Napi::Boolean::New(env, true);
 }
@@ -68,6 +75,7 @@ Napi::Boolean	ConsumeTokenFast(const Napi::CallbackInfo& info)
 Napi::Value	Cleanup(const Napi::CallbackInfo& info)
 {
 	cleanup_limiter();
+	g_initialized = false;
 	return info.Env().Undefined();
 }
 
@@ -78,9 +86,20 @@ Napi::Object	Register(Napi::Env env, Napi::Object exports)
 	exports.Set("cleanup", Napi::Function::New(env, Cleanup));
 	exports.Set("getStats", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
 		Napi::Env env = info.Env();
-		LimiterStats stats;
-		// In a full impl, read from shared memory
-		return Napi::Object::New(env);
+		Napi::Object result = Napi::Object::New(env);
+		if (!ctrl)
+			return result;
+		result.Set("totalRequests", Napi::Number::New(env,
+			static_cast<double>(ctrl->total_requests.load())));
+		result.Set("acceptedRequests", Napi::Number::New(env,
+			static_cast<double>(ctrl->accepted_requests.load())));
+		result.Set("rejectedRequests", Napi::Number::New(env,
+			static_cast<double>(ctrl->rejected_requests.load())));
+		result.Set("evictions", Napi::Number::New(env,
+			static_cast<double>(ctrl->evictions.load())));
+		result.Set("usedBuckets", Napi::Number::New(env,
+			static_cast<double>(ctrl->used_buckets.load())));
+		return result;
 	}));
 	return exports;
 }

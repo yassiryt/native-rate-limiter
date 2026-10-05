@@ -1,6 +1,6 @@
 # Native C++ Rate Limiter for Node.js
 
-A fast rate limiter using shared memory and token buckets. Runs in a single process with workers sharing memory on the same machine.
+A fast rate limiter using shared memory and token buckets. It supports multiple Node.js worker processes on the same machine.
 
 ## Install
 
@@ -25,6 +25,10 @@ app.use((req, res, next) => {
 });
 ```
 
+Set `RATE_LIMITER_SHM_NAME` before loading the addon when you need an isolated
+limiter namespace (for example, separate applications on the same machine).
+The default is `/node_rate_limiter_shm`.
+
 ## Architecture
 
         Node.js / Express
@@ -45,14 +49,15 @@ app.use((req, res, next) => {
 
 - **Shared memory** (`/node_rate_limiter_shm`) — used by multiple worker processes on one machine. Each process has its own V8 heap; only the SHM region is shared.
 - **Token bucket** — tokens refill every `windowMs` milliseconds at rate configured by `maxTokens`.
-- **LRU eviction** — uses a spinlock to safely evict old entries when the table is full. Not lock-free.
-- **Fixed table** — 65,536 buckets, FNV-1a hash with per-run random seed.
+- **LRU eviction** — uses a process-shared spinlock to safely update the table and evict old entries when it is full.
+- **Fixed table** — 65,536 buckets, FNV-1a hash with a per-shared-memory-region seed.
+- **Configuration consistency** — workers must use the same `maxTokens` and `windowMs`; conflicting configuration is rejected.
 
 ## How It Works
 
 1. **Hash** — FNV-1a hash of the IP string produces a 64-bit value
 2. **Bucket lookup** — `ip_hash % 65536` selects the bucket index
-3. **CAS atomic operations** — `compare_exchange_strong` handles concurrent insert/refresh without mutexes (for the hash table). LRU uses a spinlock.
+3. **Process-shared synchronization** — a shared spinlock serializes table mutations across workers, while counters remain atomic.
 4. **Token refill** — if `(now - last_ts) > windowMs`, tokens are restored up to `max_tokens`
 5. **LRU eviction** — when the table is full, oldest entries are evicted using a hardware spinlock to safely remove from the linked list
 6. **Per-IP isolation** — each unique IP gets its own bucket; different IPs do not interfere
@@ -96,7 +101,8 @@ Output: requests/second for the configured workload.
 - Fixed window — burst possible at window boundaries
 - No persistence across reboots (shared memory is lost if all processes exit)
 - One config for all IPs
-- LRU uses a spinlock — not lock-free
+- Table mutations use a spinlock for cross-process consistency; this is not lock-free
+- The shared-memory object remains available until the host reboots or it is explicitly removed by the system administrator
 
 ## License
 

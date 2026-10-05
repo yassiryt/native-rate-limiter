@@ -7,7 +7,7 @@
 
 enum class EvictionPolicy { LRU, FIFO };
 
-struct alignas(64)	Bucket{
+struct Bucket{
 	std::atomic<uint64_t>	ip_hash;
 	std::atomic<uint64_t>	ts;
 	std::atomic<int32_t>	toks;
@@ -17,7 +17,18 @@ struct alignas(64)	Bucket{
 const size_t	TABLE_SIZE = 65536;
 
 struct ControlBlock {
-	std::atomic_flag		lru_lock = ATOMIC_FLAG_INIT;
+	std::atomic<uint64_t>	magic;
+	std::atomic<uint32_t>	version;
+	std::atomic_flag		init_lock = ATOMIC_FLAG_INIT;
+	std::atomic_flag		data_lock = ATOMIC_FLAG_INIT;
+	std::atomic<int32_t>	max_tokens;
+	std::atomic<uint64_t>	refill_ms;
+	std::atomic<uint64_t>	hash_seed;
+	std::atomic<size_t>	used_buckets;
+	std::atomic<size_t>	total_requests;
+	std::atomic<size_t>	accepted_requests;
+	std::atomic<size_t>	rejected_requests;
+	std::atomic<size_t>	evictions;
 	std::atomic<size_t>		lru_head;
 	std::atomic<size_t>		lru_tail;
 	std::atomic<size_t>		lru_next[TABLE_SIZE];
@@ -47,5 +58,6 @@ void	lru_init();
 size_t	lru_get_head();
 size_t	lru_get_tail();
 void	lru_touch(size_t idx);
+size_t	lru_evict();
 
 #endif

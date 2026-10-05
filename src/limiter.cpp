@@ -1,184 +1,242 @@
 #include "limiter.hpp"
-#include "lru.cpp"
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <chrono>
-#include <string>
 #include <algorithm>
-#include <random>
+#include <cerrno>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
-static Bucket*		table = nullptr;
-ControlBlock*		ctrl = nullptr;
-static uint64_t		g_hash_seed = 0;
+static constexpr uint64_t SHM_MAGIC = 0x4e524c5f76320001ULL;
+static constexpr uint32_t SHM_VERSION = 2;
+static constexpr const char* DEFAULT_SHM_NAME = "/node_rate_limiter_shm";
+static Bucket* table = nullptr;
+ControlBlock* ctrl = nullptr;
+static size_t mapped_size = 0;
 
-uint64_t	secure_hash(const char* str)
+static uint64_t now_ms()
 {
-	uint64_t	hash;
-
-	hash = g_hash_seed;
-	while (*str)
-	{
-		hash ^= (uint8_t)(*str++);
-		hash *= 1099511628211ULL;
-	}
-	return hash;
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-bool	init_limiter(int32_t max_tokens, uint64_t refill_ms, const char** err_msg)
+static uint64_t secure_hash(const char* str)
 {
-	int		shm_fd;
-	size_t	i;
+	uint64_t hash = ctrl->hash_seed.load(std::memory_order_relaxed);
+	while (*str)
+	{
+		hash ^= static_cast<uint8_t>(*str++);
+		hash *= 1099511628211ULL;
+	}
+	return hash == 0 ? 1 : hash;
+}
 
+static void lock_data()
+{
+	while (ctrl->data_lock.test_and_set(std::memory_order_acquire))
+		;
+}
+
+static void unlock_data()
+{
+	ctrl->data_lock.clear(std::memory_order_release);
+}
+
+static bool valid_config(const LimiterConfig& config, const char** err_msg)
+{
+	if (config.max_tokens <= 0)
+		*err_msg = "maxTokens must be greater than zero";
+	else if (config.refill_ms == 0)
+		*err_msg = "windowMs must be greater than zero";
+	else if (config.table_size != TABLE_SIZE)
+		*err_msg = "table_size must equal TABLE_SIZE";
+	else
+		return true;
+	return false;
+}
+
+bool init_limiter(const LimiterConfig& config, const char** err_msg)
+{
 	if (table)
 		return true;
+	if (!valid_config(config, err_msg))
+		return false;
 
-	if (g_hash_seed == 0)
-		g_hash_seed = std::chrono::steady_clock::now().time_since_epoch().count();
-
-	shm_fd = shm_open("/node_rate_limiter_shm", O_CREAT | O_RDWR, 0666);
+	const char* shm_name = std::getenv("RATE_LIMITER_SHM_NAME");
+	if (!shm_name || shm_name[0] != '/')
+		shm_name = DEFAULT_SHM_NAME;
+	int shm_fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0660);
+	bool created = true;
+	if (shm_fd < 0 && errno == EEXIST)
+	{
+		shm_fd = shm_open(shm_name, O_RDWR, 0660);
+		created = false;
+	}
 	if (shm_fd < 0)
 	{
 		*err_msg = "shm_open failed";
 		return false;
 	}
-
-	size_t total_size = TABLE_SIZE * sizeof(Bucket) + sizeof(ControlBlock);
-	if (ftruncate(shm_fd, total_size) < 0)
+	mapped_size = TABLE_SIZE * sizeof(Bucket) + sizeof(ControlBlock);
+	if (created && ftruncate(shm_fd, static_cast<off_t>(mapped_size)) < 0)
 	{
-		*err_msg = "ftruncate failed";
+		static char error[128];
+		std::snprintf(error, sizeof(error), "ftruncate failed (%zu): %s", mapped_size,
+			std::strerror(errno));
+		*err_msg = error;
 		close(shm_fd);
 		return false;
 	}
-
-	table = (Bucket*)mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	void* mapped = mmap(nullptr, mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 	close(shm_fd);
-
-	if (table == MAP_FAILED)
+	if (mapped == MAP_FAILED)
 	{
 		*err_msg = "mmap failed";
 		return false;
 	}
 
-	ctrl = (ControlBlock*)((char*)table + TABLE_SIZE * sizeof(Bucket));
-
-	i = 0;
-	while (i < TABLE_SIZE)
+	table = static_cast<Bucket*>(mapped);
+	ctrl = reinterpret_cast<ControlBlock*>(static_cast<char*>(mapped)
+		+ TABLE_SIZE * sizeof(Bucket));
+	bool needs_init = ctrl->magic.load(std::memory_order_acquire) != SHM_MAGIC
+		|| ctrl->version.load(std::memory_order_acquire) != SHM_VERSION;
+	if (needs_init)
 	{
-		table[i].ip_hash.store(0, std::memory_order_relaxed);
-		table[i].toks.store(max_tokens, std::memory_order_relaxed);
-		table[i].ts.store(0, std::memory_order_relaxed);
-		i++;
+		while (ctrl->init_lock.test_and_set(std::memory_order_acquire))
+			;
+		if (ctrl->magic.load(std::memory_order_acquire) != SHM_MAGIC
+			|| ctrl->version.load(std::memory_order_acquire) != SHM_VERSION)
+		{
+			ctrl->data_lock.clear(std::memory_order_relaxed);
+			ctrl->max_tokens.store(config.max_tokens, std::memory_order_relaxed);
+			ctrl->refill_ms.store(config.refill_ms, std::memory_order_relaxed);
+			ctrl->hash_seed.store(now_ms() ^ reinterpret_cast<uintptr_t>(ctrl),
+				std::memory_order_relaxed);
+			ctrl->used_buckets.store(0, std::memory_order_relaxed);
+			ctrl->total_requests.store(0, std::memory_order_relaxed);
+			ctrl->accepted_requests.store(0, std::memory_order_relaxed);
+			ctrl->rejected_requests.store(0, std::memory_order_relaxed);
+			ctrl->evictions.store(0, std::memory_order_relaxed);
+			for (size_t i = 0; i < TABLE_SIZE; ++i)
+			{
+				table[i].ip_hash.store(0, std::memory_order_relaxed);
+				table[i].toks.store(0, std::memory_order_relaxed);
+				table[i].ts.store(0, std::memory_order_relaxed);
+				table[i].last_access = 0;
+			}
+			lru_init();
+			ctrl->version.store(SHM_VERSION, std::memory_order_relaxed);
+			ctrl->magic.store(SHM_MAGIC, std::memory_order_release);
+		}
+		ctrl->init_lock.clear(std::memory_order_release);
 	}
 
-	ctrl->lru_lock.clear(std::memory_order_relaxed);
-	ctrl->lru_head.store(0, std::memory_order_relaxed);
-	ctrl->lru_tail.store(TABLE_SIZE - 1, std::memory_order_relaxed);
-	i = 0;
-	while (i < TABLE_SIZE)
+	if (ctrl->max_tokens.load(std::memory_order_acquire) != config.max_tokens
+		|| ctrl->refill_ms.load(std::memory_order_acquire) != config.refill_ms)
 	{
-		ctrl->lru_next[i].store(i + 1, std::memory_order_relaxed);
-		i++;
+		*err_msg = "shared-memory limiter is already configured differently";
+		munmap(table, mapped_size);
+		table = nullptr;
+		ctrl = nullptr;
+		mapped_size = 0;
+		return false;
 	}
-	ctrl->lru_next[TABLE_SIZE - 1].store(SIZE_MAX, std::memory_order_relaxed);
-
 	return true;
 }
 
-bool	consume_token(const char* ip_str, int32_t max_tokens, uint64_t refill_ms)
+bool init_limiter(int32_t max_tokens, uint64_t refill_ms, const char** err_msg)
 {
-	uint64_t		ip_h;
-	size_t			idx;
-	size_t			attempts;
-	Bucket*			b;
-	uint64_t		stored_hash;
-	uint64_t		expected;
-	uint64_t		now;
-	uint64_t		last;
-	int32_t			toks;
-	int32_t			add;
-	int32_t			updated;
-
-	if (!table || !ip_str)
-		return false;
-
-	ip_h = secure_hash(ip_str);
-	idx = ip_h % TABLE_SIZE;
-	attempts = 0;
-
-	now = std::chrono::duration_cast<std::chrono::milliseconds>(
-		std::chrono::steady_clock::now().time_since_epoch()
-	).count();
-
-	while (attempts < 100)
-	{
-		b = &table[idx];
-		stored_hash = b->ip_hash.load(std::memory_order_acquire);
-
-		if (stored_hash == 0)
-		{
-			expected = 0;
-			if (b->ip_hash.compare_exchange_strong(expected, ip_h, std::memory_order_acq_rel))
-			{
-				move_lru_to_tail(idx);
-				break;
-			}
-			continue;
-		}
-
-		if (stored_hash == ip_h)
-			break;
-
-		last = b->ts.load(std::memory_order_acquire);
-		if (last > 0 && (now - last) > refill_ms)
-		{
-			if (b->ip_hash.compare_exchange_strong(stored_hash, ip_h, std::memory_order_acq_rel))
-			{
-				b->toks.store(max_tokens, std::memory_order_release);
-				b->ts.store(now, std::memory_order_release);
-				move_lru_to_tail(idx);
-				break;
-			}
-		}
-
-		idx = (idx + 1) % TABLE_SIZE;
-		attempts++;
-	}
-
-	b = &table[idx];
-	last = b->ts.load(std::memory_order_acquire);
-	toks = b->toks.load(std::memory_order_acquire);
-	add = (now - last) / refill_ms;
-
-	if (add > 0)
-	{
-		updated = std::min(max_tokens, toks + add);
-		if (b->ts.compare_exchange_strong(last, now))
-		{
-			toks = b->toks.load(std::memory_order_acquire);
-			b->toks.store(std::min(max_tokens, toks + add), std::memory_order_release);
-		}
-	}
-
-	while (toks > 0)
-	{
-		if (b->toks.compare_exchange_weak(toks, toks - 1, std::memory_order_acq_rel))
-		{
-			move_lru_to_tail(idx);
-			return true;
-		}
-	}
-
-	return false;
+	LimiterConfig config;
+	config.max_tokens = max_tokens;
+	config.refill_ms = refill_ms;
+	return init_limiter(config, err_msg);
 }
 
-void	cleanup_limiter()
+bool consume_token(const char* ip_str, int32_t max_tokens, uint64_t refill_ms)
+{
+	if (!table || !ip_str || !*ip_str)
+		return false;
+	if (max_tokens != ctrl->max_tokens.load(std::memory_order_acquire)
+		|| refill_ms != ctrl->refill_ms.load(std::memory_order_acquire))
+		return false;
+
+	lock_data();
+	ctrl->total_requests.fetch_add(1, std::memory_order_relaxed);
+	uint64_t hash = secure_hash(ip_str);
+	size_t start = hash % TABLE_SIZE;
+	size_t idx = start;
+	size_t free_idx = SIZE_MAX;
+	size_t now = now_ms();
+
+	for (size_t attempts = 0; attempts < TABLE_SIZE; ++attempts)
+	{
+		Bucket& bucket = table[idx];
+		uint64_t stored = bucket.ip_hash.load(std::memory_order_relaxed);
+		if (stored == hash)
+		{
+			free_idx = idx;
+			break;
+		}
+		if (stored == 0 && free_idx == SIZE_MAX)
+			free_idx = idx;
+		idx = (idx + 1) % TABLE_SIZE;
+	}
+	if (free_idx == SIZE_MAX)
+	{
+		free_idx = lru_evict();
+		if (free_idx == SIZE_MAX)
+		{
+			ctrl->rejected_requests.fetch_add(1, std::memory_order_relaxed);
+			unlock_data();
+			return false;
+		}
+		ctrl->evictions.fetch_add(1, std::memory_order_relaxed);
+		ctrl->used_buckets.fetch_sub(1, std::memory_order_relaxed);
+	}
+	Bucket& bucket = table[free_idx];
+	if (bucket.ip_hash.load(std::memory_order_relaxed) != hash)
+	{
+		if (bucket.ip_hash.load(std::memory_order_relaxed) == 0)
+			ctrl->used_buckets.fetch_add(1, std::memory_order_relaxed);
+		bucket.ip_hash.store(hash, std::memory_order_relaxed);
+		bucket.toks.store(max_tokens, std::memory_order_relaxed);
+		bucket.ts.store(now, std::memory_order_relaxed);
+	}
+	else
+	{
+		uint64_t last = bucket.ts.load(std::memory_order_relaxed);
+		uint64_t elapsed = now > last ? now - last : 0;
+		uint64_t add = elapsed / refill_ms;
+		if (add > 0)
+		{
+			bucket.toks.store(std::min<int64_t>(max_tokens,
+				static_cast<int64_t>(bucket.toks.load(std::memory_order_relaxed)) + add),
+				std::memory_order_relaxed);
+			bucket.ts.store(last + add * refill_ms, std::memory_order_relaxed);
+		}
+	}
+	bucket.last_access = now;
+	lru_touch(free_idx);
+	int32_t tokens = bucket.toks.load(std::memory_order_relaxed);
+	if (tokens <= 0)
+	{
+		ctrl->rejected_requests.fetch_add(1, std::memory_order_relaxed);
+		unlock_data();
+		return false;
+	}
+	bucket.toks.store(tokens - 1, std::memory_order_relaxed);
+	ctrl->accepted_requests.fetch_add(1, std::memory_order_relaxed);
+	unlock_data();
+	return true;
+}
+
+void cleanup_limiter()
 {
 	if (table && table != MAP_FAILED)
-	{
-		munmap(table, TABLE_SIZE * sizeof(Bucket) + sizeof(ControlBlock));
-		table = nullptr;
-		ctrl = nullptr;
-	}
-	shm_unlink("/node_rate_limiter_shm");
+		munmap(table, mapped_size);
+	table = nullptr;
+	ctrl = nullptr;
+	mapped_size = 0;
 }
